@@ -16,9 +16,8 @@ load_dotenv()
 
 # ── App setup ──────────────────────────────────────────────────────────
 
-app = FastAPI(title="Ayah API")
+app = FastAPI(title="Tilawah Matching API")
 
-# Rate limiter — max 10 requests per IP per minute
 limiter = Limiter(key_func=get_remote_address)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
@@ -36,14 +35,10 @@ app.add_middleware(
 
 client    = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 QURAN_API = "https://api.qurancdn.com/api/qdc"
-
-# ~1 MB cap — plenty for a 15-second clip, blocks abuse
 MAX_AUDIO_BYTES = 1_000_000
 
 
 # ── POST /identify ─────────────────────────────────────────────────────
-# Accepts: multipart form with `audio` (webm or mp4) and `mime_type`
-# Returns: verse_key, surah, ayah, surah_name, arabic_text, translation
 
 @app.post("/identify")
 @limiter.limit("10/minute")
@@ -52,20 +47,20 @@ async def identify(
     audio:     UploadFile = File(...),
     mime_type: str        = Form(default="audio/webm"),
 ):
-    # 1. Read and size-check the upload
+    # 1. Read and size-check
     data = await audio.read(MAX_AUDIO_BYTES + 1)
     if len(data) > MAX_AUDIO_BYTES:
         raise HTTPException(413, "Recording too long. Please keep it under 15 seconds.")
 
     ext = "mp4" if "mp4" in mime_type else "webm"
 
-    # 2. Write to a named temp file so Whisper can infer the audio format
+    # 2. Write temp file so Whisper can read it
     with tempfile.NamedTemporaryFile(suffix=f".{ext}", delete=False) as tmp:
         tmp.write(data)
         tmp_path = tmp.name
 
     try:
-        # 3. Transcribe with Whisper ($0.006 / minute)
+        # 3. Transcribe with Whisper
         with open(tmp_path, "rb") as f:
             transcription = await client.audio.transcriptions.create(
                 model="whisper-1",
@@ -77,42 +72,71 @@ async def identify(
         os.unlink(tmp_path)
 
     arabic_text = transcription.text.strip()
+    print(f"Whisper heard: {arabic_text}")
 
     if not arabic_text:
         raise HTTPException(422, "No speech detected. Try recording a longer passage.")
 
-    print(f"whisper heard: {arabic_text}")
-
-    # 4. Strip tashkeel, build a 6-word search anchor
+    # 4. Strip tashkeel and split into words
     stripped = strip_tashkeel(arabic_text)
-    words    = stripped.split()
-    anchor   = " ".join(words[:6])
-
-    print(f"searching Quran API for anchor: {anchor}")
+    words    = [w for w in stripped.split() if w]
+    print(f"Stripped words: {words}")
 
     async with httpx.AsyncClient(timeout=10) as http:
-        # 5. Search the Quran Foundation API
-        search = await http.get(
-            f"{QURAN_API}/search",
-            params={"q": anchor, "size": 5, "page": 1, "language": "en"},
-        )
-        search.raise_for_status()
-        results = search.json().get("search", {}).get("results", [])
 
-        if not results:
+        # ── Pass 1: try progressively shorter anchors (6 words down to 2) ──
+        match_result = None
+        for anchor_length in range(min(6, len(words)), 1, -1):
+            anchor = " ".join(words[:anchor_length])
+            print(f"Trying {anchor_length}-word anchor: {anchor}")
+
+            resp = await http.get(
+                f"{QURAN_API}/search",
+                params={"q": anchor, "size": 5, "page": 1, "language": "en"},
+            )
+            if resp.status_code != 200:
+                continue
+
+            results = resp.json().get("search", {}).get("results", [])
+            if results:
+                match_result = results
+                print(f"Matched on {anchor_length}-word anchor")
+                break
+
+        # ── Pass 2: try each individual word (skip words under 4 chars) ──
+        if not match_result:
+            print("Anchor passes failed — trying individual words")
+            for word in words:
+                if len(word) < 4:
+                    continue
+                print(f"Trying single word: {word}")
+                resp = await http.get(
+                    f"{QURAN_API}/search",
+                    params={"q": word, "size": 10, "page": 1, "language": "en"},
+                )
+                if resp.status_code != 200:
+                    continue
+                results = resp.json().get("search", {}).get("results", [])
+                if results:
+                    match_result = results
+                    print(f"Matched on single word: {word}")
+                    break
+
+        if not match_result:
             raise HTTPException(404, "Verse not found. Try recording a different passage.")
 
-        verse_key        = results[0]["verse_key"]
-        surah_num, ayah  = verse_key.split(":")
+        verse_key       = match_result[0]["verse_key"]
+        surah_num, ayah = verse_key.split(":")
+        print(f"Best match: {verse_key}")
 
-        # 6. Fetch full verse details and surah info in parallel
+        # 5. Fetch verse and surah details in parallel
         verse_resp, surah_resp = await asyncio.gather(
             http.get(
                 f"{QURAN_API}/verses/by_key/{verse_key}",
                 params={
                     "language":     "en",
                     "words":        "false",
-                    "translations": "131",   # Sahih International
+                    "translations": "131",
                     "fields":       "text_uthmani",
                 },
             ),
@@ -125,7 +149,6 @@ async def identify(
     verse_data = verse_resp.json().get("verse", {})
     surah_data = surah_resp.json().get("chapter", {})
 
-    # Strip HTML footnote tags the API sometimes includes in translations
     raw_translation = (verse_data.get("translations") or [{}])[0].get("text", "")
     translation     = strip_html(raw_translation)
 
@@ -135,9 +158,9 @@ async def identify(
         "ayah":         int(ayah),
         "surah_name":   surah_data.get("name_simple",  f"Surah {surah_num}"),
         "surah_arabic": surah_data.get("name_arabic",  ""),
-        "arabic_text":  verse_data.get("text_uthmani", results[0].get("text", "")),
+        "arabic_text":  verse_data.get("text_uthmani", match_result[0].get("text", "")),
         "translation":  translation,
-        "whisper_text": arabic_text,  # returned for debugging; remove before v1 launch
+        "whisper_text": arabic_text,
     }
 
 
