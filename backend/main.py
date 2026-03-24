@@ -81,10 +81,14 @@ async def identify(
     if not arabic_text:
         raise HTTPException(422, "No speech detected. Try recording a longer passage.")
 
+    print(f"whisper heard: {arabic_text}")
+
     # 4. Strip tashkeel, build a 6-word search anchor
     stripped = strip_tashkeel(arabic_text)
     words    = stripped.split()
     anchor   = " ".join(words[:6])
+
+    print(f"searching Quran API for anchor: {anchor}")
 
     async with httpx.AsyncClient(timeout=10) as http:
         # 5. Search the Quran Foundation API
