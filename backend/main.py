@@ -67,6 +67,8 @@ async def identify(
                 file=f,
                 language="ar",
                 response_format="verbose_json",
+                prompt="بسم الله الرحمن الرحيم، قل هو الله أحد، الله الصمد، قل أعوذ برب الفلق، قل أعوذ برب الناس",
+                temperature=0.0,
             )
     finally:
         os.unlink(tmp_path)
@@ -79,6 +81,8 @@ async def identify(
 
     # 4. Strip tashkeel and split into words
     stripped = strip_tashkeel(arabic_text)
+    stripped = re.sub(r'[،,؛;\.!؟?\-]', ' ', stripped)
+    stripped = re.sub(r'\s+', ' ', stripped).strip()  # Replace punctuation with space
     words    = [w for w in stripped.split() if w]
     print(f"Stripped words: {words}")
 
@@ -121,6 +125,39 @@ async def identify(
                     match_result = results
                     print(f"Matched on single word: {word}")
                     break
+
+# ── Pass 3: fallback to alquran.cloud with word-overlap scoring ──
+        if not match_result:
+            print("Trying alquran.cloud fallback API")
+            
+            # Collect all candidate matches across all words
+            candidates = {}  # verse_key -> {count, data}
+            
+            for word in words:
+                if len(word) < 4:
+                    continue
+                resp = await http.get(
+                    f"https://api.alquran.cloud/v1/search/{word}/all/ar",
+                )
+                if resp.status_code != 200:
+                    continue
+                matches = resp.json().get("data", {}).get("matches", [])
+                for m in matches:
+                    key = f"{m['surah']['number']}:{m['numberInSurah']}"
+                    if key not in candidates:
+                        candidates[key] = {"count": 0, "data": m}
+                    candidates[key]["count"] += 1
+
+            if candidates:
+                # Pick the verse that matched the most words
+                best_key = max(candidates, key=lambda k: candidates[k]["count"])
+                best     = candidates[best_key]
+                print(f"Best overlap match: {best_key} ({best['count']} words matched)")
+                match_result = [{
+                    "verse_key": best_key,
+                    "text":      best["data"].get("text", ""),
+                }]
+
 
         if not match_result:
             raise HTTPException(404, "Verse not found. Try recording a different passage.")
